@@ -8,6 +8,51 @@
 #include <parsi/parsi.hpp>
 
 struct Empty {};
+struct StrError { const char* str = "unknown"; };
+using RCString = std::string; // TODO
+
+template <typename ValueT, typename ErrorT = StrError>
+using Result = std::expected<ValueT, ErrorT>;
+
+template <typename T>
+using Ref = std::unique_ptr<T>;
+
+template <typename T>
+using RCRef = std::shared_ptr<T>;
+
+template <typename T>
+using WRef = std::shared_ptr<T>;
+
+template <typename T>
+using Vec = std::vector<T>;
+
+template <typename ...Ts>
+using Union = std::variant<Ts...>;
+
+template <typename ...Ts>
+using UnionVec = Vec<Union<Ts...>>;
+
+template <typename ...Ts>
+using UnionRCRefVec = UnionVec<Union<RCRef<Ts>...>>;
+
+static constexpr parsi::Charset charset_whitespaces{" \n\t"};
+static constexpr parsi::CharRange charrange_digits{'0', '9'};
+static constexpr parsi::CharRange charrange_lower_alphabet{'a', 'z'};
+static constexpr parsi::CharRange charrange_upper_alphabet{'A', 'Z'};
+
+static constexpr auto parser_whitespace = parsi::expect(charset_whitespaces);
+static constexpr auto parser_digit = parsi::expect(charrange_digits);
+static constexpr auto parser_whitespaces = parsi::repeat(parser_whitespace);
+static constexpr auto parser_digits = parsi::repeat<1>(parser_digit);
+static constexpr auto parser_lower_alphabet = parsi::expect(charrange_lower_alphabet);
+static constexpr auto parser_upper_alphabet = parsi::expect(charrange_upper_alphabet);
+
+static constexpr auto parser_expecti(std::string_view str) {
+    return [str](parsi::Stream stream) -> parsi::Result {
+        return parsi::expect(std::string(str))(stream);
+    };
+}
+
 
 struct CLI {
     std::string query;
@@ -19,7 +64,7 @@ static void print_help(std::string_view program_name) {
     std::println(std::cerr, "\t{} <query> <csv-file>", program_name);
 }
 
-static std::expected<CLI, std::string> parse_args(int argc, char* argv[]) {
+static Result<CLI, std::string> parse_args(int argc, char* argv[]) {
     if (argc != 3) {
         return std::unexpected("insufficient args.");
     }
@@ -36,143 +81,96 @@ Overloaded(Fs&&...) -> Overloaded<Fs...>;
 namespace mini {
 
 struct EOS {};
+struct Number {};
 
-// template <typename F>
-// static auto parsi_negate(F&& parser) {
-//     return [parser=std::forward<F>(parser)](parsi::Stream stream) -> parsi::Result {
-//         if (parsi::Result result = parser(stream); !result) {
-//             return result.
-//         }
-//         return 
-//     };
-// }
-
-// static auto parsi_abort(std::string error) {
-//     return [error=std::move(error)](parsi::Stream stream) -> parsi::Result {
-//         throw std::runtime_error{error + " ::: " + std::string(stream.as_string_view())};
-//     };
-// }
-
-static constexpr auto parser_whitespace = parsi::repeat(parsi::expect(parsi::Charset(" \t")));
-static constexpr auto parser_digits = parsi::repeat<1>(parsi::expect(parsi::Charset("0123456789")));
-
-static std::size_t digits_to_number(std::string_view str) {
-    std::size_t ret = 0;
-    for (char chr : str) {
-        ret *= 10;
-        ret += chr - '0';
-    }
-    return ret;
-}
-
-struct QueryTree {
-    struct Select {
-        std::vector<std::size_t> indices;
-    };
-
-    Select select;
+struct ASTWildcard {
 };
 
-static std::expected<QueryTree, Empty> parse_query(std::string_view query_str) {
-    QueryTree tree;
+struct ASTIdentifier {
+    RCString name;
+};
 
-    auto visit_select_item_cb = [&tree](std::string_view str) {
-        tree.select.indices.push_back(digits_to_number(str));
-    };
+struct ASTLiteralString {
+    RCString value;
+};
 
-    auto inner_select_parser = parsi::sequence(
-        parsi::extract(parser_digits, visit_select_item_cb),
-        parsi::repeat(
-            parsi::sequence(
-                parser_whitespace,
-                parsi::expect(','),
-                parser_whitespace,
-                parsi::extract(parser_digits, visit_select_item_cb)
-            )
-        )
-    );
+struct ASTLiteralNumeric {
+    Number value;
+};
 
-    auto select_parser = parsi::sequence(
-        parser_whitespace,
-        parsi::expect("select"),
-        parser_whitespace,
-        parsi::expect('('),
-        parser_whitespace,
-        parsi::anyof(
-            parsi::expect(')'),
-            parsi::sequence(
-                inner_select_parser,
-                parser_whitespace,
-                parsi::expect(')')
-            )
-        ),
-        parser_whitespace
-    );
+struct ASTExpressionScalar {
+    Union<ASTIdentifier, ASTLiteralString, ASTLiteralNumeric> value;
+};
 
-    if (!select_parser(query_str)) {
-        return std::unexpected(Empty{});
-    }
+struct ASTQuery;
+struct ASTSelect {
+    UnionRCRefVec<ASTQuery, ASTExpressionScalar, ASTWildcard> items;
+};
 
-    return tree;
-}
-
-static std::string query_tree_to_string(const QueryTree& query_tree) {
-    std::string ret;
-    ret += "select(";
-    if (!query_tree.select.indices.empty()) {
-        ret += std::to_string(query_tree.select.indices[0]);
-    }
-    for (std::size_t index = 1; index < query_tree.select.indices.size(); ++index) {
-        ret += ',';
-        ret += ' ';
-        ret += std::to_string(query_tree.select.indices[index]);
-    }
-    ret += ")";
-    return ret;
-}
+struct ASTQuery {
+    ASTSelect select;
+};
 
 struct QueryPlan {
-    std::unordered_set<std::size_t> select_indices;
+    // TODO
 };
 
-static std::expected<QueryPlan, Empty> plan_query(QueryTree query_tree) {
-    QueryPlan ret;
-    for (const std::size_t select_index : query_tree.select.indices) {
-        ret.select_indices.insert(select_index);
-    }
-    return ret;
-}
+class IPipeline {
+public:
+    ~IPipeline() = default;
+};
 
 struct ExecutionPlan {
-    QueryPlan plan;
+    // TODO
 };
 
-static ExecutionPlan compile_query(QueryPlan query_plan) {
-    return ExecutionPlan{.plan = std::move(query_plan)};
+static Result<ASTQuery> parse_query(const std::string_view query_str) {
+    constexpr auto parser_identifier = parsi::sequence(
+        parsi::repeat<1>(parsi::anyof(parsi::expect('_'), parser_lower_alphabet, parser_upper_alphabet)),
+        parsi::repeat(parsi::anyof(parsi::expect('_'), parser_digits, parser_lower_alphabet, parser_upper_alphabet))
+    );
+    constexpr auto parser_string_literal = parsi::sequence(
+        parsi::expect('"'),
+        parsi::repeat(parsi::expect_not('"')), // TODO
+        parsi::expect('"')
+    );
+    constexpr auto parser_numeric_literal = parsi::sequence(
+        parsi::optional(parsi::anyof(parsi::expect('-'), parsi::expect('-'))),
+        parsi::repeat<1>(parser_digits) // TODO
+    );
+    auto parser_select_item = parsi::anyof(
+        parser_identifier,
+        parser_string_literal,
+        parser_numeric_literal
+    );
+    auto parser = parsi::sequence(
+        parsi::expect("select"),
+        parser_whitespaces,
+        parser_select_item,
+        parser_whitespaces,
+        parsi::eos()
+    );
+    return ASTQuery{};
 }
 
-template <typename SourceF, typename SinkF>
-static void execute_plan(ExecutionPlan exec_plan, SourceF&& source_fn, SinkF&& sink_fn) {
-    auto callback = Overloaded{
-        [&sink_fn, &exec_plan](const std::vector<std::string_view>& columns) {
-            std::vector<std::string_view> new_columns{};
-            for (std::size_t index = 0; index < columns.size(); ++index) {
-                if (exec_plan.plan.select_indices.contains(index)) {
-                    new_columns.push_back(columns[index]);
-                }
-            }
-            sink_fn(new_columns);
-        },
-        [&sink_fn](EOS) {
-            sink_fn(EOS{});
-        }
-    };
-    source_fn(callback);
+static Result<QueryPlan> plan_query(const ASTQuery& query) {
+    return QueryPlan{};
 }
 
+static std::string query_tree_to_string(const ASTQuery& query) {
+    return "";
+}
+
+static ExecutionPlan compile_execution_plan(const QueryPlan& plan) {
+    return ExecutionPlan{};
+}
+
+static Result<Empty> execute_pipeline(ExecutionPlan pipeline) {
+    return std::unexpected(StrError{"not implemented"});
+}
 
 template <typename F>
-static std::expected<Empty, std::string_view> parse_csv(std::string_view input, F&& callback) {
+static Result<Empty> parse_csv(std::string_view input, F&& callback) {
     std::vector<std::string_view> columns;
 
     auto item_visit_cb = [&columns](std::string_view item) {
@@ -219,7 +217,7 @@ static std::expected<Empty, std::string_view> parse_csv(std::string_view input, 
     return {};
 }
 
-static std::expected<std::string, Empty> generate_csv_row(std::span<const std::string_view> columns) {
+static Result<std::string> generate_csv_row(std::span<const std::string_view> columns) {
     if (columns.size() <= 0) {
         return "";
     }
@@ -258,13 +256,13 @@ int main(int argc, char* argv[]) {
 
     std::println(std::cerr, "[Info] query tree: {}", mini::query_tree_to_string(*query_tree_res));
 
-    auto query_plan_res = mini::plan_query(std::move(*query_tree_res));
-    if (!query_plan_res) {
+    auto execution_plan_res = mini::plan_query(std::move(*query_tree_res));
+    if (!execution_plan_res) {
         std::println(std::cerr, "Error: failed to plan the query.");
         return 1;
     }
 
-    mini::ExecutionPlan execution_plan = mini::compile_query(std::move(*query_plan_res));
+    mini::ExecutionPlan execution_pipeline = mini::compile_execution_plan(std::move(*execution_plan_res));
 
     std::ifstream input_file{cli->input_file_path};
     std::istream& input_stream = (cli->input_file_path == "-") ? std::cin : input_file;
@@ -274,28 +272,30 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    auto export_fn = Overloaded{
-        [](const std::vector<std::string_view>& columns) {
-            std::println("{}", mini::generate_csv_row(columns).value_or("ERROR"));
-        },
-        [](mini::EOS) {
-            // nothing.
-        }
-    };
+    // auto export_fn = Overloaded{
+    //     [](const std::vector<std::string_view>& columns) {
+    //         std::println("{}", mini::generate_csv_row(columns).value_or("ERROR"));
+    //     },
+    //     [](mini::EOS) {
+    //         // nothing.
+    //     }
+    // };
 
-    auto source_fn = [&](auto&& receive_fn) {
-        std::string line;
-        while (std::getline(input_stream, line)) {
-            // TODO cancellable receiver
-            if (auto res = mini::parse_csv(line, receive_fn); !res) {
-                std::println(std::cerr, "error: csv parser failed. at: ", res.error());
-                break;
-            }
-        }
-        receive_fn(mini::EOS{});
-    };
+    // auto source_fn = [&](auto&& receive_fn) {
+    //     std::string line;
+    //     while (std::getline(input_stream, line)) {
+    //         // TODO cancellable receiver
+    //         if (auto res = mini::parse_csv(line, receive_fn); !res) {
+    //             std::println(std::cerr, "error: csv parser failed. at: ", res.error());
+    //             break;
+    //         }
+    //     }
+    //     receive_fn(mini::EOS{});
+    // };
 
-    mini::execute_plan(std::move(execution_plan), source_fn, export_fn);
+    if (Result<Empty> res = mini::execute_pipeline(std::move(execution_pipeline)); !res) {
+        std::println(std::cerr, "Error: pipeline execution failed: {}", res.error().str);
+    }
 
     return 0;
 }
