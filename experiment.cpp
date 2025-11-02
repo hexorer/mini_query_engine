@@ -111,6 +111,14 @@ static constexpr auto opt_cont_set(ParserT&& parser, ParserTs&& ...parsers) {
     }
 }
 
+template <typename ParserT>
+static constexpr auto pdbg(std::string_view msg, ParserT&& parser) {
+    return [msg, parser=std::forward<ParserT>(parser)](parsi::Stream stream) -> parsi::Result {
+        // std::println("[debug] message: {}", msg);
+        return parser(stream);
+    };
+};
+
 } // namespace ------------------------ parsers ------------------------
 
 namespace { // ------------------------ ast ------------------------
@@ -128,6 +136,20 @@ struct Failed {
 template <typename T>
 using ParserResult = std::expected<Parsed<T>, Failed>;
 
+template <typename T, typename F>
+static constexpr auto ast_parser(F&& visitor) {
+    return [visitor=std::forward<F>(visitor)](parsi::Stream stream) -> parsi::Result {
+        ParserResult<T> result = T::parse(stream);
+        if (!result) {
+            Failed& failed = result.error();
+            return failed.result;
+        }
+        Parsed<T>& parsed = result.value();
+        visitor(std::move(parsed.value));
+        return parsi::Result{parsed.stream, true};
+    };
+}
+
 struct ASTNumber {
     std::uint64_t number = 0;
     std::uint64_t fraction = 0;
@@ -138,27 +160,29 @@ struct ASTNumber {
     std::string stringify() const;
 };
 
-enum class BinaryOp {
-    mul,
-    div,
-    add,
-    sub,
-    pow,
-};
+struct ASTBinaryOp {
+    enum class Op {
+        mul,
+        div,
+        add,
+        sub,
+        pow,
+    };
 
-struct ASTExpr;
+    Op op;
 
-struct ASTBinOpExpr {
-    UPtr<ASTExpr> lhs;
-    BinaryOp op;
-    UPtr<ASTExpr> rhs;
-
-    static ParserResult<ASTBinOpExpr> parse(parsi::Stream stream);
+    static ParserResult<ASTBinaryOp> parse(parsi::Stream stream);
     std::string stringify() const;
 };
 
 struct ASTExpr {
-    Union<UPtr<ASTNumber>, UPtr<ASTBinOpExpr>, UPtr<ASTExpr>> subexpr;
+    struct BinaryOpExten {
+        ASTBinaryOp op;
+        UPtr<ASTExpr> rhs;
+    };
+
+    Union<UPtr<ASTNumber>, UPtr<ASTExpr>> subexpr;
+    UPtr<BinaryOpExten> binop_exten;
 
     static ParserResult<ASTExpr> parse(parsi::Stream stream);
     std::string stringify() const;
@@ -182,7 +206,7 @@ ParserResult<ASTNumber> ASTNumber::parse(parsi::Stream stream) {
         parsi::optional(parser_number_sign),
         parsi::extract(parser_digits, [&ret](std::string_view str) { ret.number = strview_to_ull(str); }),
         OptCont{
-            parsi::expect('.'),
+            parsi::extract(parsi::expect('.'), [&ret](auto&&) { ret.has_fraction = true; }),
             parsi::extract(parser_digits, [&ret](std::string_view str) { ret.fraction = strview_to_ull(str); })
         }
     );
@@ -193,14 +217,71 @@ ParserResult<ASTNumber> ASTNumber::parse(parsi::Stream stream) {
     return Parsed{ret, result.stream()};
 }
 
-ParserResult<ASTBinOpExpr> ASTBinOpExpr::parse(parsi::Stream stream)
-{
-    // TODO
+ParserResult<ASTBinaryOp> ASTBinaryOp::parse(parsi::Stream stream) {
+    ASTBinaryOp ret;
+    auto parser_operator = parsi::anyof(
+        parsi::extract(parsi::expect('*'), [&](auto&&) { ret.op = Op::mul; }),
+        parsi::extract(parsi::expect('/'), [&](auto&&) { ret.op = Op::div; }),
+        parsi::extract(parsi::expect('+'), [&](auto&&) { ret.op = Op::add; }),
+        parsi::extract(parsi::expect('-'), [&](auto&&) { ret.op = Op::sub; }),
+        parsi::extract(parsi::expect('^'), [&](auto&&) { ret.op = Op::pow; })
+    );
+    parsi::Result result = parser_operator(stream);
+    if (!result) {
+        return std::unexpected(Failed{result});
+    }
+    return Parsed{ret, result.stream()};
 }
 
-ParserResult<ASTExpr> ASTExpr::parse(parsi::Stream stream)
-{
-    // TODO
+ParserResult<ASTExpr> ASTExpr::parse(parsi::Stream stream) {
+    ASTExpr ret{};
+
+    auto ast_parser_lhs_number = ast_parser<ASTNumber>([&](ASTNumber ast) {
+        ret.subexpr = std::make_unique<ASTNumber>(std::move(ast));
+    });
+
+    auto ast_parser_lhs_expr = ast_parser<ASTExpr>([&](ASTExpr ast) {
+        ret.subexpr = std::make_unique<ASTExpr>(std::move(ast));
+    });
+
+    auto ast_parser_operator = ast_parser<ASTBinaryOp>([&](ASTBinaryOp ast) {
+        ret.binop_exten = std::make_unique<BinaryOpExten>();
+        ret.binop_exten->op = ast;
+    });
+
+    auto ast_parser_rhs_expr = ast_parser<ASTExpr>([&](ASTExpr ast) {
+        ret.binop_exten->rhs = std::make_unique<ASTExpr>(std::move(ast));
+    });
+
+    auto parser_paren_subexpr = parsi::sequence(
+        parsi::expect('('),
+        parser_whitespaces,
+        pdbg("parens->expr", ast_parser_lhs_expr),
+        parser_whitespaces,
+        parsi::expect(')')
+    );
+
+    auto parser_subexpr = opt_cont_set(
+        OptCont(Peek(parsi::expect('(')), pdbg("subexpr->parens", parser_paren_subexpr)),
+        OptCont(
+            Peek(parsi::anyof(parsi::expect('-'), parsi::expect('+'), parser_digit)),
+            pdbg("subexpr->number", ast_parser_lhs_number)
+        )
+    );
+
+    auto parser_expr = parsi::sequence(
+        parser_whitespaces,
+        pdbg("expr->subexpr", parser_subexpr),
+        parser_whitespaces,
+        OptCont{ast_parser_operator, pdbg("binop->expr", ast_parser_rhs_expr)},
+        parser_whitespaces
+    );
+
+    parsi::Result result = parser_expr(stream);
+    if (!result) {
+        return std::unexpected(Failed{result});
+    }
+    return Parsed{std::move(ret), result.stream()};
 }
 
 std::string ASTNumber::stringify() const {
@@ -214,21 +295,23 @@ std::string ASTNumber::stringify() const {
     return std::format("{}{}", is_negative ? "-" : "", number);
 }
 
-std::string ASTBinOpExpr::stringify() const {
-    const std::string_view op_str = [this]() {
-        switch (op) {
-            case BinaryOp::mul: return "*";
-            case BinaryOp::div: return "/";
-            case BinaryOp::add: return "+";
-            case BinaryOp::sub: return "-";
-        }
-        return "";
-    }();
-    return std::format("{} {} {}", lhs->stringify(), op_str, rhs->stringify());
+std::string ASTBinaryOp::stringify() const {
+    switch (op) {
+        case Op::mul: return "*";
+        case Op::div: return "/";
+        case Op::add: return "+";
+        case Op::sub: return "-";
+        case Op::pow: return "^";
+    }
+    return "";
 }
 
 std::string ASTExpr::stringify() const {
-    return std::visit([](auto&& ast_subexpr) { return ast_subexpr->stringify(); }, subexpr);
+    std::string subexpr_str = std::visit([](auto&& ast_subexpr) { return ast_subexpr->stringify(); }, subexpr);
+    if (!binop_exten) {
+        return subexpr_str;
+    }
+    return std::format("{} {} ({})", std::move(subexpr_str), binop_exten->op.stringify(), binop_exten->rhs->stringify());
 }
 
 class RTAST {
@@ -290,9 +373,6 @@ private:
 };
 } // namespace ------------------------ ast ------------------------
 
-template <typename ...>
-struct print;
-
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::println("Usage:\n\t{} <string>", argv[0]);
@@ -327,66 +407,9 @@ int main(int argc, char** argv) {
 
     // TODO make a calculator
 
-    // struct ASTNothing {
-    //     std::string stringify() const { return ""; }
-    // };
-
-    auto parser_operator = parsi::anyof(
-        parsi::extract(parsi::expect('*'), [&](auto&&) { /* binop = BinaryOp::mul; */ }),
-        parsi::extract(parsi::expect('/'), [&](auto&&) { /* binop = BinaryOp::div; */ }),
-        parsi::extract(parsi::expect('+'), [&](auto&&) { /* binop = BinaryOp::add; */ }),
-        parsi::extract(parsi::expect('-'), [&](auto&&) { /* binop = BinaryOp::sub; */ }),
-        parsi::extract(parsi::expect('^'), [&](auto&&) { /* binop = BinaryOp::pow; */ })
-    );
-
-    auto parser_number_sign = parsi::anyof(parsi::expect('-'), parsi::expect('+'));
-    auto parser_number = parsi::sequence(
-        parsi::optional(parser_number_sign),
-        parser_digits,
-        OptCont{parsi::expect('.'), parser_digits}
-    );
-
-    auto pdbg = [](std::string_view msg, auto parser) {
-        return [msg, parser](parsi::Stream stream) {
-            // std::println("[debug] message: {}", msg);
-            return parser(stream);
-        };
-    };
-
-    auto parser_expr_ref = LateRef{};
-
-    auto parser_paren_expr = parsi::sequence(
-        parsi::expect('('),
-        parser_whitespaces,
-        pdbg("parens->expr", parser_expr_ref),
-        parser_whitespaces,
-        parsi::expect(')')
-    );
-
-    auto parser_subexpr = opt_cont_set(
-        OptCont(Peek(parsi::expect('(')), pdbg("subexpr->parens", parser_paren_expr)),
-        OptCont(
-            Peek(parsi::anyof(parser_number_sign, parser_digit)),
-            parsi::extract(pdbg("subexpr->number", parser_number), [](std::string_view str) { std::println("EXPR: {}", str); })
-        )
-    );
-
-    auto parser_expr = parsi::sequence(
-        parser_whitespaces,
-        pdbg("expr->subexpr", parser_subexpr),
-        parser_whitespaces,
-        OptCont{
-            parsi::extract(parser_operator, [](std::string_view str) { std::println("OP: {}", str); }),
-            pdbg("binop->expr", parser_expr_ref)
-        },
-        parser_whitespaces
-    );
-
-    std::move(parser_expr_ref).set(parser_expr);
-
     auto parser = parsi::sequence(
         parser_whitespaces,
-        pdbg("parser->expr", parser_expr),
+        pdbg("parser->expr", ast_parser<ASTExpr>([](const ASTExpr& ast) { std::println("FINAL: {}", ast.stringify()); })),
         parser_whitespaces,
         parsi::eos()
     );
@@ -398,14 +421,6 @@ int main(int argc, char** argv) {
     }
 
     std::println("Rest: {}", result.stream().as_string_view());
-
-    // auto ast = ASTBinOpExpr{
-    //     .lhs = std::make_unique<ASTExpr>(std::make_unique<ASTNumber>(ASTNumber{.number = 12})),
-    //     .op = BinaryOp::add,
-    //     .rhs = std::make_unique<ASTExpr>(std::make_unique<ASTNumber>(ASTNumber{.number = 14})),
-    // };
-
-    // std::println("ast: {}", ast.stringify());
 
     return 0;
 }
